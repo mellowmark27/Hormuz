@@ -162,60 +162,41 @@ function drawParallaxLayer() {
 }
 
 // ── Radio Voice ───────────────────────────────────────────────────────────────
-function radioVoice(text) {
-  try {
-    if (!window.speechSynthesis) return;
-    window.speechSynthesis.cancel();
-
-    // Speak immediately — must stay within user gesture call stack
-    const utt = new SpeechSynthesisUtterance(text);
-    utt.rate  = 0.88;
-    utt.pitch = 0.82;
-    utt.volume = 1.0;
-
-    const voices = window.speechSynthesis.getVoices();
-    const preferred = voices.find(v =>
-      /en/i.test(v.lang) && /(daniel|david|alex|james|arthur|oliver|george|male)/i.test(v.name)
-    ) || voices.find(v => /en.*(GB|AU)/i.test(v.lang))
-      || voices.find(v => /en/i.test(v.lang))
-      || null;
-    if (preferred) utt.voice = preferred;
-
-    // Static squelch on end (WebAudio — not subject to gesture restriction)
-    utt.onend = () => {
-      try {
-        const ac = getAC(); if (!ac) return;
-        const t = ac.currentTime;
-        const buf = ac.createBuffer(1, ac.sampleRate * 0.12, ac.sampleRate);
-        const d = buf.getChannelData(0);
-        for (let i = 0; i < d.length; i++) d[i] = (Math.random()*2-1)*0.28;
-        const src = ac.createBufferSource(); src.buffer = buf;
-        const bp = ac.createBiquadFilter(); bp.type='bandpass'; bp.frequency.value=1800; bp.Q.value=0.8;
-        const g = ac.createGain(); g.gain.setValueAtTime(0.45,t); g.gain.exponentialRampToValueAtTime(0.001,t+0.12);
-        src.connect(bp); bp.connect(g); g.connect(ac.destination);
-        src.start(t); src.stop(t+0.14);
-      } catch(e) {}
-    };
-
-    // Opening static burst (WebAudio — fires immediately, voice starts simultaneously)
-    try {
-      const ac = getAC(); if (ac) {
-        const t = ac.currentTime;
-        const buf = ac.createBuffer(1, ac.sampleRate*0.15, ac.sampleRate);
-        const d = buf.getChannelData(0);
-        for (let i=0;i<d.length;i++) d[i]=(Math.random()*2-1)*0.35;
-        const src = ac.createBufferSource(); src.buffer=buf;
-        const bp = ac.createBiquadFilter(); bp.type='bandpass'; bp.frequency.value=1800; bp.Q.value=0.8;
-        const g = ac.createGain(); g.gain.setValueAtTime(0.55,t); g.gain.exponentialRampToValueAtTime(0.001,t+0.15);
-        src.connect(bp); bp.connect(g); g.connect(ac.destination);
-        src.start(t); src.stop(t+0.18);
-      }
-    } catch(e) {}
-
-    window.speechSynthesis.speak(utt);
-  } catch(e) {}
+// Pre-warm: call once on first user gesture so the API is unlocked for later
+let _speechWarmed = false;
+function warmSpeech() {
+  if (_speechWarmed || !window.speechSynthesis) return;
+  _speechWarmed = true;
+  const u = new SpeechSynthesisUtterance(' ');
+  u.volume = 0;
+  window.speechSynthesis.speak(u);
 }
 
+function radioVoice(text) {
+  if (!window.speechSynthesis) return;
+  // Do NOT call cancel() — it breaks Safari
+  const utt = new SpeechSynthesisUtterance(text);
+  utt.rate   = 0.88;
+  utt.pitch  = 0.82;
+  utt.volume = 1.0;
+  // Pick best available English voice — fall back gracefully to default
+  const voices = window.speechSynthesis.getVoices();
+  const v = voices.find(v => /en/i.test(v.lang) && /(daniel|david|alex|james|arthur|oliver|george)/i.test(v.name))
+         || voices.find(v => /en.*(GB|AU)/i.test(v.lang))
+         || voices.find(v => /en/i.test(v.lang));
+  if (v) utt.voice = v;
+  // Trailing squelch (WebAudio — unrestricted)
+  utt.onend = () => { try { sndCannon(); } catch(e){} };
+  window.speechSynthesis.speak(utt);
+}
+
+function fireRadioIfPending() {
+  if (!pendingRadioMsg) return;
+  const msg = pendingRadioMsg;
+  pendingRadioMsg = null;
+  // Called directly from a user gesture handler — speak() is permitted here
+  radioVoice(msg);
+}
 
 function spawnSlick(wx, y, big) {
   slicks.push({
@@ -370,7 +351,160 @@ function setEnginePitch(zone) {
   } catch(e){}
 }
 
-// ── Screen shake ──────────────────────────────────────────────────────────────
+// ── Ambient Sound System ──────────────────────────────────────────────────────
+let ambientWaveNode=null, ambientWaveGn=null;
+let ambientWindNode=null, ambientWindGn=null;
+let ambientGullTimer=0;
+
+function startAmbient() {
+  try {
+    const ac=getAC(); if(!ac) return;
+    if(ambientWaveNode) return; // already running
+
+    // ── Ocean waves: pink-ish noise through a slow LFO-modulated lowpass ──
+    const bufLen = ac.sampleRate * 4; // 4s looping buffer
+    const waveBuf = ac.createBuffer(1, bufLen, ac.sampleRate);
+    const wd = waveBuf.getChannelData(0);
+    // Generate noise with pink-ish rolloff (accumulate then normalise)
+    let b0=0,b1=0,b2=0,b3=0,b4=0,b5=0;
+    for(let i=0;i<bufLen;i++){
+      const wh = Math.random()*2-1;
+      b0=0.99886*b0+wh*0.0555179; b1=0.99332*b1+wh*0.0750759;
+      b2=0.96900*b2+wh*0.1538520; b3=0.86650*b3+wh*0.3104856;
+      b4=0.55000*b4+wh*0.5329522; b5=-0.7616*b5-wh*0.0168980;
+      wd[i]=(b0+b1+b2+b3+b4+b5+wh*0.5362)*0.11;
+    }
+    ambientWaveNode = ac.createBufferSource();
+    ambientWaveNode.buffer = waveBuf;
+    ambientWaveNode.loop = true;
+
+    // Lowpass to keep it rumbling, not hissy
+    const wlp = ac.createBiquadFilter();
+    wlp.type='lowpass'; wlp.frequency.value=420; wlp.Q.value=0.7;
+
+    // Slow LFO on gain — wave surge rhythm ~0.18Hz
+    const waveLFO = ac.createOscillator();
+    waveLFO.frequency.value = 0.18;
+    const waveLFOGn = ac.createGain();
+    waveLFOGn.gain.value = 0.018; // LFO depth
+    const waveLFOBase = ac.createGain();
+    waveLFOBase.gain.value = 0.055; // base wave volume
+
+    waveLFO.connect(waveLFOGn);
+    waveLFOGn.connect(waveLFOBase.gain);
+
+    ambientWaveGn = waveLFOBase;
+    ambientWaveNode.connect(wlp);
+    wlp.connect(ambientWaveGn);
+    ambientWaveGn.connect(ac.destination);
+    ambientWaveNode.start();
+    waveLFO.start();
+
+    // ── Light wind: high-passed noise, very quiet ──
+    const windBuf = ac.createBuffer(1, ac.sampleRate*3, ac.sampleRate);
+    const wnd = windBuf.getChannelData(0);
+    for(let i=0;i<wnd.length;i++) wnd[i]=(Math.random()*2-1)*0.3;
+    ambientWindNode = ac.createBufferSource();
+    ambientWindNode.buffer = windBuf;
+    ambientWindNode.loop = true;
+    const whp = ac.createBiquadFilter();
+    whp.type='bandpass'; whp.frequency.value=900; whp.Q.value=0.4;
+    ambientWindGn = ac.createGain();
+    ambientWindGn.gain.value = 0.022;
+    ambientWindNode.connect(whp); whp.connect(ambientWindGn);
+    ambientWindGn.connect(ac.destination);
+    ambientWindNode.start();
+
+    ambientGullTimer = 8 + Math.random()*12; // first gull in 8-20s
+  } catch(e){}
+}
+
+function stopAmbient() {
+  try { if(ambientWaveNode){ambientWaveNode.stop();ambientWaveNode=null;ambientWaveGn=null;} } catch(e){}
+  try { if(ambientWindNode){ambientWindNode.stop();ambientWindNode=null;ambientWindGn=null;} } catch(e){}
+}
+
+function sndSeagull() {
+  // Real gull: sawtooth (harmonic richness) + bandpass filter + simple pitch glide
+  // "kee-yow" shape — fast rise, slow fall, no FM
+  try {
+    const ac=getAC(); if(!ac) return;
+    const calls = 1 + Math.floor(Math.random()*3); // 1-3 cries per visit
+
+    for(let c=0;c<calls;c++){
+      const ct = ac.currentTime + c * (0.55 + Math.random()*0.25);
+      const pitch = 780 + Math.random()*180; // vary between gulls
+
+      // Tone: sawtooth for harmonic content
+      const osc = ac.createOscillator();
+      osc.type = 'sawtooth';
+      // Pitch envelope: quick rise ("kee") then fall ("yow")
+      osc.frequency.setValueAtTime(pitch * 0.72, ct);
+      osc.frequency.linearRampToValueAtTime(pitch, ct + 0.08);
+      osc.frequency.linearRampToValueAtTime(pitch * 0.62, ct + 0.38);
+
+      // Bandpass to cut harsh highs and mud — centre ~1.1kHz, moderate Q
+      const bp = ac.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.value = 1100;
+      bp.Q.value = 1.8;
+
+      // Noise layer — gives the raspy breathiness of a real gull
+      const nBuf = ac.createBuffer(1, ac.sampleRate * 0.45, ac.sampleRate);
+      const nd = nBuf.getChannelData(0);
+      for(let i=0;i<nd.length;i++) nd[i] = Math.random()*2-1;
+      const nSrc = ac.createBufferSource(); nSrc.buffer = nBuf;
+      const nbp = ac.createBiquadFilter();
+      nbp.type = 'bandpass'; nbp.frequency.value = 1400; nbp.Q.value = 2.2;
+      const nGn = ac.createGain(); nGn.gain.value = 0.09;
+
+      // Master gain envelope — attack 40ms, sustain, release 120ms
+      const g = ac.createGain();
+      g.gain.setValueAtTime(0, ct);
+      g.gain.linearRampToValueAtTime(0.13, ct + 0.04);
+      g.gain.setValueAtTime(0.11, ct + 0.20);
+      g.gain.exponentialRampToValueAtTime(0.001, ct + 0.42);
+
+      // Short room decay — single delay tap, no feedback
+      const dly = ac.createDelay(0.25);
+      dly.delayTime.value = 0.09;
+      const dlyGn = ac.createGain(); dlyGn.gain.value = 0.14;
+
+      osc.connect(bp); bp.connect(g);
+      nSrc.connect(nbp); nbp.connect(nGn); nGn.connect(g);
+      g.connect(ac.destination);
+      g.connect(dly); dly.connect(dlyGn); dlyGn.connect(ac.destination);
+
+      osc.start(ct); osc.stop(ct + 0.45);
+      nSrc.start(ct); nSrc.stop(ct + 0.45);
+    }
+  } catch(e){}
+}
+
+function updateAmbient(dt) {
+  if(!ambientWaveNode) return;
+  // Gull timer
+  ambientGullTimer -= dt;
+  if(ambientGullTimer <= 0){
+    sndSeagull();
+    ambientGullTimer = 14 + Math.random()*22; // next gull in 14-36s
+  }
+  // Fade wave volume with zone — quieter in CHOKE (more enclosed)
+  try {
+    if(ambientWaveGn){
+      const ac=getAC(); if(!ac) return;
+      const zv={GULF:0.055,STRAIT:0.042,CHOKE:0.028,OMAN:0.06}[zoneCurrent]||0.05;
+      ambientWaveGn.gain.setTargetAtTime(zv, ac.currentTime, 2.5);
+    }
+    if(ambientWindGn){
+      const ac=getAC(); if(!ac) return;
+      const wv={GULF:0.022,STRAIT:0.030,CHOKE:0.038,OMAN:0.018}[zoneCurrent]||0.022;
+      ambientWindGn.gain.setTargetAtTime(wv, ac.currentTime, 3.0);
+    }
+  } catch(e){}
+}
+
+
 let shake=null, shakeLastMs=0;
 function startShake(type,amp) {
   if (shake && shake.amp>=amp && shake.t<shake.dur*.6) return;
@@ -422,6 +556,15 @@ function updateTicker(dt) {
       item.text=HEADLINES[rndI(0,HEADLINES.length)]; item.w=0;
     }
   }
+}
+
+// Inject a BREAKING item — cuts to the front of the visible ticker immediately
+function injectBreaking(text) {
+  if (!tickerItems) return;
+  // Find the rightmost item currently on screen or just off-right
+  const frontX = Math.max(...tickerItems.map(t=>t.x));
+  // Place it just ahead of the leading item so it appears next
+  tickerItems.push({ text: '  ◆ BREAKING: ' + text + '  ◆  ', x: frontX + 180, w: 0, breaking: true });
 }
 
 // ── Intel Briefing System ─────────────────────────────────────────────────────
@@ -693,18 +836,7 @@ function newGame() {
   gs='PLAY';
   attempts++; saveCrossings();
   startEngine();
-}
-
-function fireRadioIfPending() {
-  if (!pendingRadioMsg) return;
-  const msg = pendingRadioMsg;
-  pendingRadioMsg = null;
-  // Inside a user gesture — voices are guaranteed available here
-  if (window.speechSynthesis && window.speechSynthesis.getVoices().length === 0) {
-    window.speechSynthesis.addEventListener('voiceschanged', () => radioVoice(msg), {once:true});
-  } else {
-    radioVoice(msg);
-  }
+  startAmbient();
 }
 
 // ── Input ─────────────────────────────────────────────────────────────────────
@@ -725,6 +857,7 @@ document.addEventListener('keydown', e=>{
 document.addEventListener('keyup', e=>{ keys[e.code]=false; });
 document.addEventListener('mousemove', e=>{ mouseX=e.clientX; mouseY=e.clientY; });
 document.addEventListener('click', e=>{
+  warmSpeech();
   if (gs==='WIN')      { fireRadioIfPending(); gs='BRIEFING'; return; }
   if (gs==='BRIEFING') {
     if (briefingT < activeBriefing.body.length / 85) { briefingT = 999; return; }
@@ -735,6 +868,7 @@ document.addEventListener('click', e=>{
 });
 C.addEventListener('touchstart', e=>{
   e.preventDefault();
+  warmSpeech();
   if (gs==='WIN')      { fireRadioIfPending(); gs='BRIEFING'; return; }
   if (gs==='BRIEFING') {
     if (briefingT < activeBriefing.body.length / 85) { briefingT = 999; return; }
@@ -891,6 +1025,28 @@ function spawnFinalSalvo() {
   for(let i=0;i<count;i++){const wx=bwx+i*rnd(180,300);mkEnemy('missile',wx,coastY(IRAN_PTS,wx)+15);}
 }
 
+function spawnIRGCSwarm() {
+  // 4-5 boats spawn in a loose forward arc, converge on player over ~8s
+  const count = 4 + (Math.random()<0.4?1:0) + (spawnMod.boatCountBonus||0);
+  const bwx = player.wx + W*0.65;
+  const iY=coastY(IRAN_PTS,bwx), oY=coastY(OMAN_PTS,bwx);
+  const ch=oY-iY;
+  for(let i=0;i<count;i++){
+    const frac=i/(count-1); // 0..1 spread across channel
+    const wx=bwx + rnd(40,140) + i*rnd(60,110);
+    const y=iY + ch*(0.12 + frac*0.72); // spread from near-Iran to near-Oman
+    const e={type:'speedboat',wx,y,timer:0,
+      vx:rnd(-55,-80),
+      shootT:rnd(2.5,5),
+      w:22,h:9,
+      swarm:true,       // flag — these boats home in
+      swarmT:0,         // age counter
+      swarmDur:8+rnd(0,3), // seconds until full convergence
+    };
+    enemies.push(e);
+  }
+}
+
 // ── Update ────────────────────────────────────────────────────────────────────
 let prevT=0;
 function update(ts) {
@@ -898,6 +1054,23 @@ function update(ts) {
   if (gs!=='PLAY') return;
 
   gTime+=dt; score+=dt*12;
+
+  // TSS lane bonus — outbound lane is 18–42% of channel depth
+  if(zoneCurrent==='STRAIT'||zoneCurrent==='CHOKE'){
+    const tIy=coastY(IRAN_PTS,player.wx), tOy=coastY(OMAN_PTS,player.wx);
+    const ch=tOy-tIy, relY=(player.y-tIy)/ch;
+    const inLane = relY>=0.18 && relY<=0.42;
+    if(inLane) score+=dt*6; // +6pts/s bonus for lane compliance
+    // AIS warning — throttled to once per 12s to avoid ticker spam
+    if(!inLane && (zoneCurrent==='STRAIT'||zoneCurrent==='CHOKE')){
+      if(!player.aisWarnCooldown) player.aisWarnCooldown=0;
+      player.aisWarnCooldown-=dt;
+      if(player.aisWarnCooldown<=0){
+        injectBreaking('AIS ALERT: Vessel deviation from TSS outbound lane — UKMTO notified');
+        player.aisWarnCooldown=12;
+      }
+    }
+  }
   if(hitFlash>0)    hitFlash-=dt*3;
   if(muzzleFlash>0) muzzleFlash-=dt*8;
   if(player.cannonCool>0) player.cannonCool-=dt;
@@ -906,7 +1079,7 @@ function update(ts) {
   scrollX+=(62+wave*4)*dt*(1-slickPenalty*0.55); player.wx=scrollX+W*.25;
   if(scrollX+W>=WORLD_W){
     finalScore=Math.round(score+hull*14);
-    crossings++; saveCrossings(); stopEngine();
+    crossings++; saveCrossings(); stopEngine(); stopAmbient();
     const msgs = [
       `This is United States Fifth Fleet, Gulf of Oman sector. Captain, congratulations on a successful transit of the Strait of Hormuz. You are now clear of Iranian territorial waters and in safe international waters. You are free to proceed full steam ahead. Bon voyage, and safe passage.`,
       `Captain, this is Coalition Maritime Force. Well done on completing your transit. You are now in the Gulf of Oman in international waters. All threats have been left behind. Proceed on your course at full speed. Bon voyage.`,
@@ -947,28 +1120,58 @@ function update(ts) {
     }
   }
 
-  wakes.push({wx:player.wx-6,y:player.y,l:1});
-  if(wakes.length>50) wakes.shift();
-  wakes.forEach(w=>w.l-=dt*1.9);
+  // Wake — V-shape trail: two diverging arms + centre foam
+  const wakeAge = dt * 1.4;
+  wakes.forEach(w=>{ w.l-=wakeAge; w.spread=(w.spread||0)+dt*28; });
+  // Spawn new wake node each frame with spread seed
+  wakes.push({wx:player.wx-PL_W/2+2, y:player.y, l:1, spread:0,
+    vy: player.vy*0.12 }); // carry a little of the player's vertical drift
+  if(wakes.length>80) wakes.shift();
 
   // Zone
   zonePrev=zoneCurrent; zoneCurrent=getZone(player.wx);
   if(zoneCurrent!==zonePrev){
     zoneBannerText={GULF:'PERSIAN GULF',STRAIT:'STRAIT OF HORMUZ',CHOKE:'⚠ HORMUZ CHOKEPOINT',OMAN:'GULF OF OMAN'}[zoneCurrent]||'';
     zoneBannerLife=2.8;
-    if(zoneCurrent==='STRAIT') oilShock(6);
-    if(zoneCurrent==='CHOKE')  oilShock(18);
-    if(zoneCurrent==='OMAN')   oilCalm(8);
+    if(zoneCurrent==='STRAIT'){
+      oilShock(6);
+      injectBreaking('Tanker transiting Strait of Hormuz — Brent crude $OIL/bbl and rising');
+    }
+    if(zoneCurrent==='CHOKE'){
+      oilShock(18);
+      injectBreaking('IRGCN vessels shadowing commercial traffic in Hormuz chokepoint — war-risk premiums surge');
+    }
+    if(zoneCurrent==='OMAN'){
+      oilCalm(8);
+      injectBreaking('Vessel reports clear passage into Gulf of Oman — threat level reduced');
+    }
   }
   if(zoneBannerLife>0) zoneBannerLife-=dt;
   setEnginePitch(zoneCurrent);
 
   // Scripted
-  if(!chokeDone&&player.wx>=Z_CHOKE_S+60){chokeDone=true;spawnChokeSwarm();startShake('roll',6);}
-  if(!salvoDone&&player.wx>=Z_SALVO){salvoDone=true;spawnFinalSalvo();zoneBannerText='⚠ FINAL APPROACH — MISSILES INBOUND';zoneBannerLife=3.2;oilShock(22);}
+  if(!chokeDone&&player.wx>=Z_CHOKE_S+60){
+    chokeDone=true; spawnChokeSwarm(); startShake('roll',6);
+    injectBreaking('Tanker under attack in Strait of Hormuz — Brent crude surges to $OIL/bbl');
+  }
+  if(!salvoDone&&player.wx>=Z_SALVO){
+    salvoDone=true; spawnFinalSalvo();
+    zoneBannerText='⚠ FINAL APPROACH — MISSILES INBOUND'; zoneBannerLife=3.2; oilShock(22);
+    injectBreaking('MISSILE ALERT: Ballistic threat reported in final Hormuz approach corridor — markets in freefall');
+  }
 
   // Wave & spawn
   waveTimer+=dt; if(waveTimer>13*(spawnMod.waveSlow?1.5:1)){wave++;waveTimer=0;}
+  // IRGC swarm — fires once per ~30s in STRAIT/CHOKE independently of normal waves
+  if(!player.swarmTimer) player.swarmTimer=28+rnd(0,10);
+  if(zoneCurrent==='STRAIT'||zoneCurrent==='CHOKE'){
+    player.swarmTimer-=dt;
+    if(player.swarmTimer<=0){
+      spawnIRGCSwarm();
+      player.swarmTimer=28+rnd(0,12);
+      injectBreaking('IRGCN fast-attack craft swarm intercepting outbound tanker');
+    }
+  }
   spawnTimer-=dt;
   if(spawnTimer<=0){
     spawnWave();
@@ -984,15 +1187,41 @@ function update(ts) {
     // Missiles falling below screen without hitting — remove
     if(e.type==='missile'&&e.y>H+80){enemies.splice(i,1);continue;}
     if(e.type==='drone'){
-      // Shahed-136: straight kamikaze run, no course correction
+      if(e.seeking && !e.diverted){
+        const ddx=player.wx-e.wx, ddy=player.y-e.y, dd=Math.hypot(ddx,ddy)||1;
+        const spd=Math.hypot(e.vx,e.vy)||100;
+        e.vx+=(ddx/dd*spd-e.vx)*0.06;
+        e.vy+=(ddy/dd*spd-e.vy)*0.06;
+        e.angle=Math.atan2(e.vy,e.vx);
+      } else if(e.diverted){
+        e.vx*=0.995; e.vy*=0.995;
+      }
       e.wx+=e.vx*dt; e.y+=e.vy*dt;
+      // Flyover shake — drone passing close
+      if(Math.abs(e.wx-player.wx)<60&&Math.abs(e.y-player.y)<55){
+        startShake('snap',3);
+      }
     } else if(e.type==='missile'){
       // Parabolic dive: constant forward speed, gravity-driven descent
       e.wx+=e.vx*dt; e.vy+=e.gravity*dt; e.y+=e.vy*dt;
       // Once it enters the water channel, stop warning
       if(e.y>=coastY(IRAN_PTS,e.wx)) e.warn=false;
     } else if(e.type==='speedboat'){
-      e.wx+=e.vx*dt; e.y+=Math.sin(e.timer*2.4)*38*dt;
+      if(e.swarm){
+        // Swarm phase: blend from arc drift into direct pursuit over swarmDur seconds
+        e.swarmT+=dt;
+        const t=Math.min(e.swarmT/e.swarmDur,1); // 0=arc drift, 1=full pursuit
+        // Arc drift component
+        e.wx+=e.vx*dt;
+        e.y+=Math.sin(e.timer*2.4)*38*(1-t)*dt;
+        // Pursuit component — steer toward player Y
+        const dyP=player.y-e.y;
+        e.y+=dyP*t*1.8*dt;
+        // Once converged, behave like normal speedboat
+        if(t>=1){ e.swarm=false; }
+      } else {
+        e.wx+=e.vx*dt; e.y+=Math.sin(e.timer*2.4)*38*dt;
+      }
       const fireRate = spawnMod.boatFireRate || 1;
       if((e.shootT-=dt*fireRate)<=0){
         const reactTime = spawnMod.boatReactTime || 1;
@@ -1014,11 +1243,11 @@ function update(ts) {
         const dmg=e.type==='missile'?35:e.type==='mine'?42:15;
         hull-=dmg; player.iframes=1.8; hitFlash=.8; oilShock(dmg);
         spawnSlick(player.wx, player.y, true);
-        if(e.type==='missile') startShake('roll',11);
-        else if(e.type==='mine') startShake('thud',14);
+        if(e.type==='missile'){startShake('roll',11);injectBreaking('Tanker struck by ballistic missile in Hormuz corridor — Brent crude $OIL/bbl');}
+        else if(e.type==='mine'){startShake('thud',14);injectBreaking('Mine strike reported in Hormuz TSS — UKMTO issues navigation warning');}
         else startShake('snap',7);
         sndHit(); boom(e.wx,e.y); enemies.splice(i,1);
-        if(hull<=0){hull=0;finalScore=Math.round(score);stopEngine();gs='DEAD';return;}
+        if(hull<=0){hull=0;finalScore=Math.round(score);stopEngine();stopAmbient();gs='DEAD';return;}
         continue;
       }
     }
@@ -1042,8 +1271,13 @@ function update(ts) {
         hull-=10;player.iframes=.7;hitFlash=.6;oilShock(10);startShake('snap',5);sndHit();
         spawnSlick(player.wx, player.y, false);
         boom(b.wx,b.y,.4);bullets.splice(i,1);
-        if(hull<=0){hull=0;finalScore=Math.round(score);stopEngine();gs='DEAD';return;}
+        if(hull<=0){hull=0;finalScore=Math.round(score);stopEngine();stopAmbient();gs='DEAD';return;}
         continue;
+      }
+      // Near-miss — bullet passes within 28px without hitting
+      const nearDx=Math.abs(b.wx-player.wx), nearDy=Math.abs(b.y-player.y);
+      if(nearDx<28&&nearDy<28&&nearDx>PL_W/2+5){
+        startShake('snap',2.5);
       }
     }
   }
@@ -1104,6 +1338,7 @@ function update(ts) {
   }
 
   updateTicker(dt);
+  updateAmbient(dt);
 }
 
 // ── Draw ──────────────────────────────────────────────────────────────────────
@@ -1121,20 +1356,119 @@ function drawBg() {
     X.fillStyle=vg;X.fillRect(0,0,W,H);
   }
   drawParallaxLayer();
-  X.strokeStyle='rgba(0,140,255,.052)';X.lineWidth=.8;
-  const gsp=72,ox=scrollX%gsp;
-  for(let x=-ox;x<W;x+=gsp){X.beginPath();X.moveTo(x,0);X.lineTo(x,H);X.stroke();}
-  for(let y=0;y<H;y+=gsp){X.beginPath();X.moveTo(0,y);X.lineTo(W,y);X.stroke();}
+
+  // ── Dynamic water — two parallax wave layers + deep shimmer ──────────────
   const n=Date.now()/1000;
-  X.strokeStyle='rgba(60,160,255,.025)';X.lineWidth=1.5;
-  for(let i=0;i<22;i++){
-    const y=(i*H/22+n*5)%H;
-    X.beginPath();X.moveTo(0,y+Math.sin(n*.6+i)*2.5);X.lineTo(W,y+Math.cos(n*.5+i*1.3)*2.5);X.stroke();
+  const iYw=coastY(IRAN_PTS,player.wx), oYw=coastY(OMAN_PTS,player.wx);
+  const waterTop=iYw, waterBot=oYw;
+
+  // Layer 1 — slow deep swells (scroll at 30% of world speed)
+  const ox1=(scrollX*0.30)%W;
+  X.strokeStyle='rgba(30,90,160,0.18)'; X.lineWidth=1.2;
+  for(let row=0;row<14;row++){
+    const baseY=waterTop+(waterBot-waterTop)*row/13;
+    X.beginPath();
+    for(let x=-ox1-40;x<W+40;x+=4){
+      const wx=x+scrollX*0.30;
+      const sy=baseY
+        + Math.sin(wx*0.008 + n*0.7)*6
+        + Math.sin(wx*0.014 + n*0.5 + row)*3;
+      x===-Math.floor(ox1)-40?X.moveTo(x,sy):X.lineTo(x,sy);
+    }
+    X.stroke();
+  }
+
+  // Layer 2 — fast surface chop (scroll at 70% of world speed)
+  const ox2=(scrollX*0.70)%W;
+  X.strokeStyle='rgba(80,160,230,0.09)'; X.lineWidth=0.7;
+  for(let row=0;row<22;row++){
+    const baseY=waterTop+(waterBot-waterTop)*row/21;
+    X.beginPath();
+    for(let x=-ox2-20;x<W+20;x+=3){
+      const wx=x+scrollX*0.70;
+      const sy=baseY
+        + Math.sin(wx*0.022 + n*1.4 + row*0.6)*2.5
+        + Math.cos(wx*0.031 + n*1.1)*1.5;
+      x===-Math.floor(ox2)-20?X.moveTo(x,sy):X.lineTo(x,sy);
+    }
+    X.stroke();
+  }
+
+  // Glint layer — sparse bright highlights that drift across
+  X.fillStyle='rgba(160,210,255,0.12)';
+  for(let g=0;g<8;g++){
+    const gx=((scrollX*0.5 + g*137.5 + Math.sin(n*0.3+g)*80) % (W+80)) - 40;
+    const gy=waterTop+(waterBot-waterTop)*(0.15+g*0.09+Math.sin(n*0.4+g)*0.06);
+    const gr=Math.abs(Math.sin(n*0.8+g*2.1));
+    X.beginPath(); X.ellipse(gx,gy,14*gr+4,2.5,0,0,Math.PI*2); X.fill();
   }
   const iY=coastY(IRAN_PTS,player.wx),oY=coastY(OMAN_PTS,player.wx);
   X.setLineDash([18,14]);X.strokeStyle='rgba(255,215,80,.16)';X.lineWidth=1.2;
   X.beginPath();X.moveTo(0,iY+(oY-iY)*.62);X.lineTo(W,iY+(oY-iY)*.62);X.stroke();
   X.setLineDash([]);
+
+  // ── TSS lanes — only visible in STRAIT and CHOKE zones ───────────────────
+  if(zone==='STRAIT'||zone==='CHOKE'){
+    // Outbound (player's lane): upper third of channel — dashed white
+    // Inbound: lower third — dashed amber. Separation zone between them.
+    // Historically: outbound NE lane sits roughly 30% down, inbound 65% down
+    const tssSteps=40;
+    const x0s=scrollX-80, x1s=scrollX+W+80;
+    X.lineWidth=1.4;
+
+    // Outbound lane boundaries (player should be here heading east)
+    X.setLineDash([14,10]);
+    X.strokeStyle='rgba(180,220,255,0.28)'; // cool white — navigational
+    X.beginPath();
+    for(let i=0;i<=tssSteps;i++){
+      const wx=x0s+(x1s-x0s)*i/tssSteps;
+      const iy=coastY(IRAN_PTS,wx), oy=coastY(OMAN_PTS,wx);
+      const sy=iy+(oy-iy)*0.18; // upper edge of outbound lane
+      const sx2=wx-scrollX;
+      i?X.lineTo(sx2,sy):X.moveTo(sx2,sy);
+    }
+    X.stroke();
+    X.beginPath();
+    for(let i=0;i<=tssSteps;i++){
+      const wx=x0s+(x1s-x0s)*i/tssSteps;
+      const iy=coastY(IRAN_PTS,wx), oy=coastY(OMAN_PTS,wx);
+      const sy=iy+(oy-iy)*0.42; // lower edge of outbound / top of separation
+      const sx2=wx-scrollX;
+      i?X.lineTo(sx2,sy):X.moveTo(sx2,sy);
+    }
+    X.stroke();
+
+    // Inbound lane boundaries
+    X.strokeStyle='rgba(255,200,100,0.22)'; // amber — inbound traffic
+    X.beginPath();
+    for(let i=0;i<=tssSteps;i++){
+      const wx=x0s+(x1s-x0s)*i/tssSteps;
+      const iy=coastY(IRAN_PTS,wx), oy=coastY(OMAN_PTS,wx);
+      const sy=iy+(oy-iy)*0.58;
+      const sx2=wx-scrollX;
+      i?X.lineTo(sx2,sy):X.moveTo(sx2,sy);
+    }
+    X.stroke();
+    X.beginPath();
+    for(let i=0;i<=tssSteps;i++){
+      const wx=x0s+(x1s-x0s)*i/tssSteps;
+      const iy=coastY(IRAN_PTS,wx), oy=coastY(OMAN_PTS,wx);
+      const sy=iy+(oy-iy)*0.82;
+      const sx2=wx-scrollX;
+      i?X.lineTo(sx2,sy):X.moveTo(sx2,sy);
+    }
+    X.stroke();
+    X.setLineDash([]);
+
+    // Lane labels — faint
+    X.fillStyle='rgba(180,220,255,0.18)';
+    X.font=`${Math.min(H*.022,9)}px Courier New`;
+    X.textAlign='left';X.textBaseline='middle';
+    const midIy=coastY(IRAN_PTS,player.wx), midOy=coastY(OMAN_PTS,player.wx);
+    X.fillText('OUTBOUND →',14,midIy+(midOy-midIy)*0.30);
+    X.fillStyle='rgba(255,200,100,0.15)';
+    X.fillText('← INBOUND',14,midIy+(midOy-midIy)*0.70);
+  }
   const lbl={GULF:'PERSIAN GULF',STRAIT:'STRAIT OF HORMUZ',CHOKE:'HORMUZ CHOKEPOINT',OMAN:'GULF OF OMAN'}[zone]||'';
   X.fillStyle=zone==='CHOKE'?'rgba(255,80,60,.13)':'rgba(255,215,80,.10)';
   X.font=`${Math.min(H*.09,26)}px Courier New`;
@@ -1185,18 +1519,66 @@ function drawIslands(){
 function drawWakes(){
   for(const w of wakes){
     if(w.l<=0) continue;
-    X.fillStyle=`rgba(170,225,255,${w.l*.25})`;
-    X.beginPath();X.ellipse(w.wx-scrollX,w.y,13*(1-w.l*.25),3.5,0,0,Math.PI*2);X.fill();
+    const sx=w.wx-scrollX;
+    const spread=w.spread||0;
+    const alpha=w.l*0.22;
+    const foamAlpha=w.l*0.35;
+
+    // Port arm (above)
+    X.strokeStyle=`rgba(200,230,255,${alpha})`;
+    X.lineWidth=Math.max(0.5, w.l*2.2);
+    X.beginPath();
+    X.moveTo(sx, w.y);
+    X.lineTo(sx-spread*0.6, w.y-spread*0.55);
+    X.stroke();
+
+    // Starboard arm (below)
+    X.beginPath();
+    X.moveTo(sx, w.y);
+    X.lineTo(sx-spread*0.6, w.y+spread*0.55);
+    X.stroke();
+
+    // Centre foam dots — random scatter along centre line
+    if(w.l>0.15){
+      const foamCount=Math.ceil(w.l*4);
+      for(let i=0;i<foamCount;i++){
+        const fx=sx - spread*0.6*(i/foamCount) + (Math.random()-0.5)*4;
+        const fy=w.y + (w.vy||0)*i*0.4 + (Math.random()-0.5)*5;
+        X.fillStyle=`rgba(220,240,255,${foamAlpha*(1-i/foamCount)})`;
+        X.beginPath();
+        X.arc(fx, fy, w.l*2.5*(1-i/foamCount*0.6), 0, Math.PI*2);
+        X.fill();
+      }
+    }
   }
 }
 
 function drawPlayer(){
   const sx=player.wx-scrollX,sy=player.y;
   if(player.iframes>0&&(player.iframes*9|0)%2===0) return;
-  X.save();X.translate(sx,sy);
+  const n=Date.now()/1000;
+
+  X.save();
+  X.translate(sx,sy);
+
+  // Hull list — skew the canvas when critically damaged
+  if(hull<25){
+    const listAngle = (0.08 + Math.sin(n*0.9)*0.03) * (1-(hull/25));
+    X.rotate(listAngle);
+  }
+
   X.fillStyle='#2C3E50';X.beginPath();
   X.moveTo(PL_W/2,0);X.lineTo(PL_W/2-10,-PL_H/2);X.lineTo(-PL_W/2,-PL_H/2);
   X.lineTo(-PL_W/2,PL_H/2);X.lineTo(PL_W/2-10,PL_H/2);X.closePath();X.fill();
+
+  // Hull damage tint — redden as damage mounts
+  if(hull<50){
+    const dmgAlpha=(1-hull/50)*0.35;
+    X.fillStyle=`rgba(180,30,10,${dmgAlpha})`;X.beginPath();
+    X.moveTo(PL_W/2,0);X.lineTo(PL_W/2-10,-PL_H/2);X.lineTo(-PL_W/2,-PL_H/2);
+    X.lineTo(-PL_W/2,PL_H/2);X.lineTo(PL_W/2-10,PL_H/2);X.closePath();X.fill();
+  }
+
   X.fillStyle='#3D5166';X.fillRect(-PL_W/2+4,-PL_H/2+3,PL_W-18,PL_H-6);
   X.fillStyle='#ECF0F1';X.fillRect(-PL_W/2+5,-PL_H/2+4,14,PL_H-8);
   X.fillStyle='#5D7D95';for(let i=0;i<4;i++) X.fillRect(-4+i*13,-PL_H/2+5,10,PL_H-10);
@@ -1204,7 +1586,28 @@ function drawPlayer(){
   X.beginPath();X.moveTo(PL_W/2,0);X.lineTo(PL_W/2-6,-5);X.lineTo(PL_W/2-6,5);X.closePath();X.fill();
   X.fillStyle='#95A5A6';X.beginPath();X.arc(4,0,5.5,0,Math.PI*2);X.fill();
   X.fillStyle='#BDC3C7';X.fillRect(4,-2.5,18,5);
+
+  // On-hull fire and smoke — attached to ship, not floating free
+  if(hull<50){
+    const intensity=1-hull/50; // 0 at 50%, 1 at 0%
+    const fireCount=Math.floor(2+intensity*4);
+    for(let i=0;i<fireCount;i++){
+      const fx=rnd(-PL_W/2+8, PL_W/2-14);
+      const fy=rnd(-PL_H/2-8, PL_H/2+4);
+      const phase=n*8+i*1.3;
+      const flicker=0.6+Math.sin(phase)*0.4;
+      // Smoke puff
+      X.fillStyle=`rgba(45,40,35,${0.4*intensity*flicker})`;
+      X.beginPath();X.arc(fx-2,fy-6,4+intensity*3,0,Math.PI*2);X.fill();
+      // Flame
+      const fc=hull<25?`rgba(255,80,10,${0.85*flicker})`:`rgba(255,160,20,${0.75*flicker})`;
+      X.fillStyle=fc;
+      X.beginPath();X.arc(fx,fy,2.5+intensity*2*flicker,0,Math.PI*2);X.fill();
+    }
+  }
+
   X.restore();
+
   if(muzzleFlash>0){
     const fsx=sx+PL_W/2+20,fa=muzzleFlash/.14;
     const fg=X.createRadialGradient(fsx,sy,0,fsx,sy,22);
@@ -1534,15 +1937,29 @@ function drawTicker(){
   X.save();X.rect(0,ty,W,th);X.clip();
   X.font=`bold ${Math.min(th*.72,11)}px Courier New`;X.textBaseline='middle';
   const ratio=Math.min((oilPrice-OIL_BASE)/(190-OIL_BASE),1);
+  const n=Date.now()/1000;
   for(const item of tickerItems){
     const label=item.text.replace('$OIL',`$${oilPrice.toFixed(2)}`);
-    if(!item.w) item.w=X.measureText(label+'   ◆   ').width;
-    const isPx=item.text.includes('$OIL');
-    X.fillStyle=isPx?(ratio<.4?`rgb(${(ratio/.4*200)|0},${(200-ratio/.4*60)|0},40)`:`rgb(220,${(200-(ratio-.4)/.6*160)|0},20)`):'rgba(140,200,120,.75)';
-    X.fillText(label+'   ◆   ',item.x,ty+th/2);
-    if(isPx){
-      X.fillStyle=oilPrice>OIL_BASE+2?'#E74C3C':oilPrice<OIL_BASE-1?'#2ECC71':'#AAA';
-      X.fillText(oilPrice>OIL_BASE+2?' ▲':oilPrice<OIL_BASE-1?' ▼':' ─',item.x+X.measureText(label).width,ty+th/2);
+    if(!item.w) item.w=X.measureText(label).width;
+    if(item.breaking){
+      // Alternating red/amber flash for BREAKING items
+      const flash=(n*3|0)%2;
+      X.fillStyle=flash?'rgba(255,60,40,0.95)':'rgba(255,200,40,0.95)';
+      X.fillText(label,item.x,ty+th/2);
+      // Recycle back to a normal headline once scrolled off — don't keep looping as BREAKING
+      if(item.x<-(item.w+20)){
+        item.text=HEADLINES[rndI(0,HEADLINES.length)];
+        item.w=0; item.breaking=false;
+        item.x=Math.max(...tickerItems.map(t=>t.x))+360;
+      }
+    } else {
+      const isPx=item.text.includes('$OIL');
+      X.fillStyle=isPx?(ratio<.4?`rgb(${(ratio/.4*200)|0},${(200-ratio/.4*60)|0},40)`:`rgb(220,${(200-(ratio-.4)/.6*160)|0},20)`):'rgba(140,200,120,.75)';
+      X.fillText(label+'   ◆   ',item.x,ty+th/2);
+      if(isPx){
+        X.fillStyle=oilPrice>OIL_BASE+2?'#E74C3C':oilPrice<OIL_BASE-1?'#2ECC71':'#AAA';
+        X.fillText(oilPrice>OIL_BASE+2?' ▲':oilPrice<OIL_BASE-1?' ▼':' ─',item.x+X.measureText(label).width,ty+th/2);
+      }
     }
   }
   X.restore();X.textBaseline='alphabetic';
