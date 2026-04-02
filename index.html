@@ -162,31 +162,68 @@ function drawParallaxLayer() {
 }
 
 // ── Radio Voice ───────────────────────────────────────────────────────────────
-// Pre-warm: call once on first user gesture so the API is unlocked for later
-let _speechWarmed = false;
-function warmSpeech() {
-  if (_speechWarmed || !window.speechSynthesis) return;
-  _speechWarmed = true;
-  const u = new SpeechSynthesisUtterance(' ');
-  u.volume = 0;
-  window.speechSynthesis.speak(u);
+function radioBeep(ac, t, pitch, dur, vol){
+  const o=ac.createOscillator(); o.type='sine'; o.frequency.value=pitch;
+  const g=ac.createGain();
+  g.gain.setValueAtTime(0,t);
+  g.gain.linearRampToValueAtTime(vol,t+0.012);
+  g.gain.setValueAtTime(vol,t+dur-0.015);
+  g.gain.linearRampToValueAtTime(0,t+dur);
+  o.connect(g); g.connect(ac.destination);
+  o.start(t); o.stop(t+dur+0.02);
+}
+
+function radioStatic(ac, t, dur, vol){
+  const bufLen=Math.ceil(ac.sampleRate*dur);
+  const buf=ac.createBuffer(1,bufLen,ac.sampleRate);
+  const d=buf.getChannelData(0);
+  for(let i=0;i<bufLen;i++) d[i]=(Math.random()*2-1);
+  const src=ac.createBufferSource(); src.buffer=buf;
+  const bp=ac.createBiquadFilter(); bp.type='bandpass'; bp.frequency.value=1600; bp.Q.value=0.8;
+  const g=ac.createGain();
+  g.gain.setValueAtTime(0,t);
+  g.gain.linearRampToValueAtTime(vol,t+0.03);
+  g.gain.setValueAtTime(vol,t+dur-0.03);
+  g.gain.linearRampToValueAtTime(0,t+dur);
+  src.connect(bp); bp.connect(g); g.connect(ac.destination);
+  src.start(t); src.stop(t+dur+0.05);
 }
 
 function radioVoice(text) {
   if (!window.speechSynthesis) return;
-  // Do NOT call cancel() — it breaks Safari
+
+  // cancel() clears any stale queue, then speak() immediately — both sync in gesture
+  window.speechSynthesis.cancel();
   const utt = new SpeechSynthesisUtterance(text);
-  utt.rate   = 0.88;
-  utt.pitch  = 0.82;
+  utt.rate   = 0.92;
+  utt.pitch  = 1.0;
   utt.volume = 1.0;
-  // Pick best available English voice — fall back gracefully to default
   const voices = window.speechSynthesis.getVoices();
-  const v = voices.find(v => /en/i.test(v.lang) && /(daniel|david|alex|james|arthur|oliver|george)/i.test(v.name))
-         || voices.find(v => /en.*(GB|AU)/i.test(v.lang))
-         || voices.find(v => /en/i.test(v.lang));
+  const v = voices.find(v=>/en/i.test(v.lang)&&/(daniel|arthur|oliver|george|james)/i.test(v.name))
+         || voices.find(v=>/en.*(GB|AU)/i.test(v.lang))
+         || voices.find(v=>/en/i.test(v.lang));
   if (v) utt.voice = v;
-  // Trailing squelch (WebAudio — unrestricted)
-  utt.onend = () => { try { sndCannon(); } catch(e){} };
+
+  // Beeps via WebAudio — fire synchronously (no gesture restriction)
+  utt.onstart = () => {
+    try {
+      const ac=getAC(); if(!ac) return;
+      const t=ac.currentTime;
+      radioStatic(ac, t, 0.12, 0.25);
+      radioBeep(ac, t+0.08, 1000, 0.16, 0.30);
+      radioBeep(ac, t+0.26, 1400, 0.12, 0.25);
+    } catch(e) {}
+  };
+  utt.onend = () => {
+    try {
+      const ac=getAC(); if(!ac) return;
+      const t=ac.currentTime;
+      radioStatic(ac, t, 0.10, 0.20);
+      radioBeep(ac, t+0.06, 1400, 0.10, 0.22);
+      radioBeep(ac, t+0.18, 1000, 0.08, 0.18);
+    } catch(e) {}
+  };
+
   window.speechSynthesis.speak(utt);
 }
 
@@ -194,7 +231,6 @@ function fireRadioIfPending() {
   if (!pendingRadioMsg) return;
   const msg = pendingRadioMsg;
   pendingRadioMsg = null;
-  // Called directly from a user gesture handler — speak() is permitted here
   radioVoice(msg);
 }
 
@@ -541,7 +577,17 @@ const HEADLINES=[
 ];
 function initTicker() {
   oilPrice=OIL_BASE; oilTarget=OIL_BASE;
-  tickerItems=HEADLINES.map((h,i)=>({text:h,x:W+i*360,w:0}));
+  // Measure widths before placing so spacing is accurate from frame 1
+  const tmp=document.createElement('canvas').getContext('2d');
+  tmp.font=`bold 11px Courier New`;
+  let xPos=W+40;
+  tickerItems=HEADLINES.map(h=>{
+    const label=h+'   ◆   ';
+    const w=Math.ceil(tmp.measureText(label).width);
+    const item={text:h,x:xPos,w};
+    xPos+=w+60;
+    return item;
+  });
 }
 function oilShock(d) { oilTarget=Math.min(oilTarget+d*rnd(.2,.35),190); }
 function oilCalm(a)  { oilTarget=Math.max(OIL_BASE,oilTarget-a); }
@@ -549,22 +595,33 @@ function updateTicker(dt) {
   oilPrice+=(oilTarget-oilPrice)*Math.min(dt*1.4,1);
   oilTarget+=(OIL_BASE-oilTarget)*dt*.08;
   const spd=58+(oilPrice-OIL_BASE)*.4;
-  for (const item of tickerItems) {
+  for(let i=tickerItems.length-1;i>=0;i--){
+    const item=tickerItems[i];
     item.x-=spd*dt;
-    if (item.x<-(item.w||400)) {
-      item.x=Math.max(...tickerItems.map(t=>t.x))+360;
-      item.text=HEADLINES[rndI(0,HEADLINES.length)]; item.w=0;
+    if(item.x<-(item.w||600)){
+      if(item.breaking){
+        tickerItems.splice(i,1);
+      } else {
+        // Place after rightmost item using its actual measured width
+        const rightmost=tickerItems.reduce((a,b)=>b.x>a.x?b:a,{x:-9999,w:0});
+        item.x=rightmost.x+(rightmost.w||600)+60;
+        item.text=HEADLINES[rndI(0,HEADLINES.length)];
+        item.w=0;
+      }
     }
   }
 }
 
-// Inject a BREAKING item — cuts to the front of the visible ticker immediately
 function injectBreaking(text) {
-  if (!tickerItems) return;
-  // Find the rightmost item currently on screen or just off-right
-  const frontX = Math.max(...tickerItems.map(t=>t.x));
-  // Place it just ahead of the leading item so it appears next
-  tickerItems.push({ text: '  ◆ BREAKING: ' + text + '  ◆  ', x: frontX + 180, w: 0, breaking: true });
+  if(!tickerItems||!tickerItems.length) return;
+  if(tickerItems.filter(t=>t.breaking).length>=2) return;
+  const label='  ◆ BREAKING: '+text+'  ◆  ';
+  // Measure now so spacing is correct from frame 1
+  const tmp=document.createElement('canvas').getContext('2d');
+  tmp.font='bold 11px Courier New';
+  const w=Math.ceil(tmp.measureText(label).width);
+  const rightmost=tickerItems.reduce((a,b)=>b.x>a.x?b:a,{x:W,w:0});
+  tickerItems.push({text:label, x:rightmost.x+(rightmost.w||600)+60, w, breaking:true});
 }
 
 // ── Intel Briefing System ─────────────────────────────────────────────────────
@@ -857,7 +914,6 @@ document.addEventListener('keydown', e=>{
 document.addEventListener('keyup', e=>{ keys[e.code]=false; });
 document.addEventListener('mousemove', e=>{ mouseX=e.clientX; mouseY=e.clientY; });
 document.addEventListener('click', e=>{
-  warmSpeech();
   if (gs==='WIN')      { fireRadioIfPending(); gs='BRIEFING'; return; }
   if (gs==='BRIEFING') {
     if (briefingT < activeBriefing.body.length / 85) { briefingT = 999; return; }
@@ -868,7 +924,6 @@ document.addEventListener('click', e=>{
 });
 C.addEventListener('touchstart', e=>{
   e.preventDefault();
-  warmSpeech();
   if (gs==='WIN')      { fireRadioIfPending(); gs='BRIEFING'; return; }
   if (gs==='BRIEFING') {
     if (briefingT < activeBriefing.body.length / 85) { briefingT = 999; return; }
@@ -1081,10 +1136,11 @@ function update(ts) {
     finalScore=Math.round(score+hull*14);
     crossings++; saveCrossings(); stopEngine(); stopAmbient();
     const msgs = [
-      `This is United States Fifth Fleet, Gulf of Oman sector. Captain, congratulations on a successful transit of the Strait of Hormuz. You are now clear of Iranian territorial waters and in safe international waters. You are free to proceed full steam ahead. Bon voyage, and safe passage.`,
-      `Captain, this is Coalition Maritime Force. Well done on completing your transit. You are now in the Gulf of Oman in international waters. All threats have been left behind. Proceed on your course at full speed. Bon voyage.`,
-      `Attention vessel, this is UKMTO Dubai. Your transit of the Hormuz strait is confirmed complete. You are clear of all restricted zones and in international waters. Resume normal passage. Well done, Captain. Bon voyage.`,
-      `Captain, Fifth Fleet here. Outstanding transit. Strait of Hormuz is astern. You are in open international waters with clear passage ahead. The cargo is safe. Full steam ahead, and bon voyage.`,
+      `Vessel, this is Fifth Fleet, Gulf of Oman. You are clear of the strait. All threats are astern. You are in safe international waters. Proceed full steam ahead. Well done, Captain. Out.`,
+      `All stations, UKMTO Dubai. Transit of Hormuz corridor is complete. Vessel is clear of restricted zones. Masters are advised to resume normal passage. Safe voyage. Out.`,
+      `Captain, this is Coalition Maritime Force. Outstanding. You made it through. Gulf of Oman is open water. Cargo status confirmed secure. Proceed on your heading. Bon voyage. Out.`,
+      `This is Fifth Fleet. Hormuz transit confirmed complete. Iranian waters are clear astern. You have open sea ahead. The oil flows. Good work out there. Out.`,
+      `Vessel, Fifth Fleet Bahrain. Strait of Hormuz is behind you. You are free to proceed at full speed. UKMTO has you on screen. Safe passage. Out.`,
     ];
     pendingRadioMsg = msgs[(crossings-1) % msgs.length];
     selectBriefing();
@@ -1940,25 +1996,21 @@ function drawTicker(){
   const n=Date.now()/1000;
   for(const item of tickerItems){
     const label=item.text.replace('$OIL',`$${oilPrice.toFixed(2)}`);
-    if(!item.w) item.w=X.measureText(label).width;
     if(item.breaking){
-      // Alternating red/amber flash for BREAKING items
+      // Breaking: text is pre-formatted, width pre-measured
+      if(!item.w) item.w=X.measureText(label).width;
       const flash=(n*3|0)%2;
       X.fillStyle=flash?'rgba(255,60,40,0.95)':'rgba(255,200,40,0.95)';
       X.fillText(label,item.x,ty+th/2);
-      // Recycle back to a normal headline once scrolled off — don't keep looping as BREAKING
-      if(item.x<-(item.w+20)){
-        item.text=HEADLINES[rndI(0,HEADLINES.length)];
-        item.w=0; item.breaking=false;
-        item.x=Math.max(...tickerItems.map(t=>t.x))+360;
-      }
     } else {
+      const display=label+'   ◆   ';
+      if(!item.w) item.w=X.measureText(display).width;
       const isPx=item.text.includes('$OIL');
       X.fillStyle=isPx?(ratio<.4?`rgb(${(ratio/.4*200)|0},${(200-ratio/.4*60)|0},40)`:`rgb(220,${(200-(ratio-.4)/.6*160)|0},20)`):'rgba(140,200,120,.75)';
-      X.fillText(label+'   ◆   ',item.x,ty+th/2);
+      X.fillText(display,item.x,ty+th/2);
       if(isPx){
         X.fillStyle=oilPrice>OIL_BASE+2?'#E74C3C':oilPrice<OIL_BASE-1?'#2ECC71':'#AAA';
-        X.fillText(oilPrice>OIL_BASE+2?' ▲':oilPrice<OIL_BASE-1?' ▼':' ─',item.x+X.measureText(label).width,ty+th/2);
+        X.fillText(oilPrice>OIL_BASE+2?' ▲':oilPrice<OIL_BASE-1?' ▼':' ─',item.x+item.w,ty+th/2);
       }
     }
   }
